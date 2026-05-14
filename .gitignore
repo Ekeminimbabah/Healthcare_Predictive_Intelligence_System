@@ -1,0 +1,24 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+.env
+admissions.csv
+data_dictionary.csv
+diagnosis.csv
+ed_visits.csv
+lab_results.csv
+medications.csv
+patients.csv
+readmissions.csv
+vitals.csv
+health/venv
+health
+health/
+venv/
+.env
+__pycache__/
+.ipynb_checkpoints/
+*.pkl
+*.csv
+mhn predictive dataset/
+MHN_Dataset/
+model/
+mlartifacts/
