@@ -552,10 +552,11 @@ elif page == "📈 ED Demand Forecast":
     </div>
     """, unsafe_allow_html=True)
 
-    model_path     = os.path.join(MODEL_DIR, "demand_model.joblib")
+    model_path     = os.path.join(MODEL_DIR, "xgb_demand_model.joblib")
+    seed_path      = os.path.join(MODEL_DIR, "xgb_seed_values.npy")
     last_date_path = os.path.join(MODEL_DIR, "demand_last_date.txt")
     if not os.path.exists(model_path):
-        st.warning("Model not trained yet. Run `python training/demand_forecast.py` first.")
+        st.warning("XGBoost model not trained yet. Run `python training/demand_forecast.py` first.")
         st.stop()
 
     with open(last_date_path) as f:
@@ -571,19 +572,25 @@ elif page == "📈 ED Demand Forecast":
         future_dates = pd.date_range(
             last_train_date + timedelta(days=1), periods=forecast_days, freq="D"
         )
-        future_X = pd.DataFrame({
-            "day_of_week": future_dates.dayofweek,
-            "month":       future_dates.month,
-            "is_weekend":  future_dates.dayofweek.isin([5, 6]).astype(int),
-        })
-        preds, conf = load_model(model_path).predict(
-            n_periods=forecast_days, X=future_X, return_conf_int=True
-        )
+        # Iterative forecasting: predict one day at a time using lag features
+        # Each prediction becomes the next day's lag_1
+        xgb_model   = load_model(model_path)
+        seed_values = np.load(seed_path)   # last 7 real training values
+        history     = list(seed_values)
+        preds       = []
+        for _ in range(forecast_days):
+            lag_1          = history[-1]
+            lag_7          = history[-7]
+            rolling_mean_7 = float(np.mean(history[-7:]))
+            pred = float(xgb_model.predict([[lag_1, lag_7, rolling_mean_7]])[0])
+            pred = max(0.0, pred)   # visits can't be negative
+            preds.append(pred)
+            history.append(pred)
         st.session_state.ed_result = {
             "dates": [str(d.date()) for d in future_dates],
-            "preds": [float(v) for v in preds],
-            "lower": [float(v) for v in conf[:, 0]],
-            "upper": [float(v) for v in conf[:, 1]],
+            "preds": preds,
+            "lower": preds,   # XGBoost has no built-in confidence interval
+            "upper": preds,
             "days":  forecast_days,
         }
 

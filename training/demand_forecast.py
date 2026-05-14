@@ -10,12 +10,11 @@ Steps:
     4.  Check stationarity  (ADF test — is the series stable over time?)
     5.  Check seasonality   (seasonal decomposition — weekly/monthly pattern?)
     6.  Decide model        (ARIMA if no seasonality, SARIMAX if seasonal)
-    7.  Add time features   (day_of_week, month, is_weekend)
-    8.  Add lag features    (lag_1, lag_7, rolling_mean_7)
-    9.  Time-based split    (train = up to 2023, test = 2024 onward)
-    10. Fit AutoARIMA       (auto-picks best (p,d,q) or (p,d,q)(P,D,Q,m))
-    11. Evaluate            (MAE, RMSE)
-    12. Log to MLflow
+    7.  Time-based split    (train = up to 2023, test = 2024 onward)
+    8.  Fit AutoARIMA       (past observations only — no external features)
+    9.  Evaluate            (MAE, RMSE, R²)
+    10. Fit Prophet         (compare — handles spikes and seasonality)
+    11. Log to MLflow
 """
 
 import os
@@ -27,12 +26,24 @@ matplotlib.use("Agg")   # works without a screen (servers, notebooks)
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, r2_score
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.seasonal import seasonal_decompose
 import pmdarima as pm
 import joblib
 import mlflow
+
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except ImportError:
+    PROPHET_AVAILABLE = False
+
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
@@ -230,116 +241,56 @@ def decide_model(is_seasonal: bool) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 7 — Add time-based features
+# STEP 7 — Time-based train / test split
 # ══════════════════════════════════════════════════════════════════════════
-def time_features(daily: pd.Series) -> pd.DataFrame:
+def split(daily: pd.Series):
     """
-    Convert the plain series into a DataFrame with calendar features.
-    These features capture patterns the ARIMA family cannot:
-      day_of_week → Monday spike? Friday drop?
-      is_weekend  → weekend vs weekday pattern
-      month       → seasonal month-of-year effect
+    For time series we NEVER shuffle randomly.
+    We cut at a fixed date:
+      Train → 2020-2023  (the model learns from this history)
+      Test  → 2024       (we evaluate on unseen future dates)
     """
-    print("\n── STEP 7: Add time-based features ──")
+    print("\n── STEP 7: Time-based train/test split ──")
 
-    ts = daily.to_frame()
-    ts["day_of_week"] = ts.index.dayofweek     # 0=Monday … 6=Sunday
-    ts["month"]       = ts.index.month
-    ts["is_weekend"]  = ts["day_of_week"].isin([5, 6]).astype(int)
-
-    print("  Added: day_of_week, month, is_weekend")
-    return ts
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 8 — Add lag features
-# ══════════════════════════════════════════════════════════════════════════
-def lag_features(ts: pd.DataFrame) -> pd.DataFrame:
-    """
-    Lag features are what makes forecasting work!
-
-    lag_1         → yesterday's visits (very strong signal)
-    lag_7         → same day last week (captures weekly pattern)
-    rolling_mean_7 → 7-day average (smooths noise)
-    """
-    print("\n── STEP 8: Add lag features ──")
-
-    ts["lag_1"]          = ts["ed_visits"].shift(1)
-    ts["lag_7"]          = ts["ed_visits"].shift(7)
-    ts["rolling_mean_7"] = ts["ed_visits"].rolling(7).mean()
-
-    print("  Added: lag_1, lag_7, rolling_mean_7")
-    print("  Note: ARIMA models use lags internally — these are shown for educational clarity")
-    return ts
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 9 — Time-based train / test split
-# ══════════════════════════════════════════════════════════════════════════
-def split(ts: pd.DataFrame):
-    """
-    IMPORTANT: For time series we NEVER use random_split.
-    We cut the series at a point in time:
-      Train → past data (2020-2023) — model learns from this
-      Test  → future data (2024)    — we evaluate on this
-
-    This simulates real-world forecasting.
-    """
-    print("\n── STEP 9: Time-based train/test split ──")
-
-    train_y = ts.loc[ts.index <= TRAIN_END, "ed_visits"]
-    test_y  = ts.loc[ts.index >= TEST_START, "ed_visits"]
-
-    # Calendar features as exogenous variables (known for any future date)
-    exog_cols = ["day_of_week", "month", "is_weekend"]
-    train_X = ts.loc[ts.index <= TRAIN_END, exog_cols]
-    test_X  = ts.loc[ts.index >= TEST_START, exog_cols]
+    train_y = daily[daily.index <= TRAIN_END]
+    test_y  = daily[daily.index >= TEST_START]
 
     print(f"  Train: {train_y.index.min().date()} → {train_y.index.max().date()}  ({len(train_y)} days)")
     print(f"  Test : {test_y.index.min().date()} → {test_y.index.max().date()}  ({len(test_y)} days)")
-    print("  ✓ No random shuffle — always use chronological split for time series")
 
-    return train_y, test_y, train_X, test_X
+    return train_y, test_y
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # STEP 10 — Fit AutoARIMA
 # ══════════════════════════════════════════════════════════════════════════
-def fit_autoarima(train_y: pd.Series, train_X: pd.DataFrame, model_choice: str):
+def fit_autoarima(train_y: pd.Series, model_choice: str):
     """
-    AutoARIMA tries many combinations of (p, d, q) and picks the best
-    one using AIC (lower AIC = better model with less complexity).
-
-    If model_choice == 'SARIMAX', it also searches seasonal (P, D, Q, m=7).
-    If model_choice == 'ARIMA',   it only searches (p, d, q).
-
-    train_X holds calendar features (day_of_week, month, is_weekend) passed
-    as exogenous variables so the model can learn day/month patterns.
-    This removes the guesswork — no need to manually tune parameters.
+    AutoARIMA searches for the best (p, d, q) — or (p,d,q)(P,D,Q,7) for
+    seasonal data — using only the past values of the series.
+    No external/calendar features: the model learns purely from history.
     """
-    print(f"\n── STEP 10: Fit AutoARIMA ({model_choice}) ──")
+    print(f"\n── STEP 8: Fit AutoARIMA ({model_choice}) ──")
     print("  Searching for best parameters... (may take 1-2 minutes)")
 
     use_seasonal = (model_choice == "SARIMAX")
 
     model = pm.auto_arima(
         train_y,
-        X=train_X,                    # calendar features: day_of_week, month, is_weekend
         seasonal=use_seasonal,
-        m=7 if use_seasonal else 1,   # weekly period if seasonal
+        m=7 if use_seasonal else 1,   # weekly period
         start_p=1, max_p=3,
         start_q=1, max_q=3,
-        d=None,                       # ADF test will choose d automatically
+        d=None,                       # auto-select differencing
         start_P=0, max_P=2,
         start_Q=0, max_Q=2,
         D=None,
-        with_intercept=True,
         stepwise=True,
         information_criterion="aic",
         test="adf",
         error_action="ignore",
         suppress_warnings=True,
-        n_jobs=1,                     # required on Windows to avoid errors
+        n_jobs=1,
     )
 
     print(f"  Best order found : {model.order}")
@@ -353,34 +304,28 @@ def fit_autoarima(train_y: pd.Series, train_X: pd.DataFrame, model_choice: str):
 # ══════════════════════════════════════════════════════════════════════════
 # STEP 11 — Evaluate the model
 # ══════════════════════════════════════════════════════════════════════════
-def evaluate(model, train_y: pd.Series, test_y: pd.Series, test_X: pd.DataFrame):
+def evaluate(model, train_y: pd.Series, test_y: pd.Series):
     """
-    Generate forecast for the test period and compare against actuals.
-
-    Metrics:
-      MAE  → average absolute error in ED visits (easy to interpret)
-      RMSE → penalises large errors more (sensitive to spikes)
-
-    MAPE is excluded: with a mean of ~6 visits/day the small denominator
-    inflates percentage errors and makes the model look far worse than it is.
+    Forecast the test period using only past observations and measure accuracy.
+      MAE  → average error in visits/day (easy to interpret)
+      RMSE → penalises large spikes more than MAE
+      R²   → how much variance the model explains (1.0 = perfect)
     """
-    print("\n── STEP 11: Evaluate model ──")
+    print("\n── STEP 9: Evaluate model ──")
 
-    # Forecast the same number of days as the test set
-    y_pred, conf_arr = model.predict(n_periods=len(test_y), X=test_X, return_conf_int=True)
+    y_pred, conf_arr = model.predict(n_periods=len(test_y), return_conf_int=True)
     y_true = test_y.values
 
     mae  = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    r2   = r2_score(y_true, y_pred)
 
     print(f"\n  ┌─────────────────────────────────┐")
     print(f"  │  MAE  = {mae:6.2f} visits/day      │")
     print(f"  │  RMSE = {rmse:6.2f} visits/day      │")
+    print(f"  │  R²   = {r2:6.3f}                 │")
     print(f"  └─────────────────────────────────┘")
-    print("  Interpretation:")
     print(f"    On average, the model is off by {mae:.1f} ED visits per day")
-    print(f"    Note: MAPE excluded — daily counts are small (~6/day) so")
-    print(f"          percentage errors are inflated and misleading")
 
     # ── Forecast plot ───────────────────────────────────────────────────
     conf_df = pd.DataFrame(conf_arr, index=test_y.index, columns=["lower", "upper"])
@@ -391,7 +336,7 @@ def evaluate(model, train_y: pd.Series, test_y: pd.Series, test_X: pd.DataFrame)
     pd.Series(y_pred, index=test_y.index).plot(ax=ax, label="Forecast", color="#d62728", linestyle="--")
     ax.fill_between(test_y.index, conf_df["lower"], conf_df["upper"],
                     alpha=0.2, color="#d62728", label="95% confidence interval")
-    ax.set_title(f"Daily ED Visits — Forecast vs Actual  (MAE={mae:.2f}, RMSE={rmse:.2f})")
+    ax.set_title(f"Daily ED Visits — Forecast vs Actual  (MAE={mae:.2f}, RMSE={rmse:.2f}, R²={r2:.3f})")
     ax.set_ylabel("ED Visits")
     ax.legend()
     plt.tight_layout()
@@ -401,13 +346,163 @@ def evaluate(model, train_y: pd.Series, test_y: pd.Series, test_X: pd.DataFrame)
     plt.close()
     print(f"\n  Forecast plot saved → {plot_path}")
 
-    return mae, rmse, plot_path
+    return mae, rmse, r2, plot_path
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 11b — Prophet model (spike / holiday capture)
+# ══════════════════════════════════════════════════════════════════════════
+def fit_prophet(train_y: pd.Series, test_y: pd.Series) -> tuple:
+    """
+    Fits a simple Prophet model and evaluates it on the test set.
+    Prophet is good at capturing spikes and holiday effects automatically.
+    Returns (mae, rmse, plot_path) — or None if Prophet is not installed.
+    """
+    if not PROPHET_AVAILABLE:
+        print("\n── STEP 11b: Prophet — SKIPPED (run: pip install prophet) ──")
+        return None
+
+    print("\n── STEP 11b: Fit Prophet model ──")
+
+    # Prophet requires a DataFrame with columns 'ds' (date) and 'y' (value)
+    train_df = train_y.reset_index().rename(columns={"date": "ds", "ed_visits": "y"})
+
+    model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        seasonality_mode="additive",
+    )
+    model.fit(train_df)
+
+    # Build a future DataFrame covering the test period
+    future = pd.DataFrame({"ds": test_y.index})
+    forecast = model.predict(future)
+
+    y_pred = forecast["yhat"].values
+    y_true = test_y.values
+
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    r2   = r2_score(y_true, y_pred)
+
+    print(f"\n  ┌─────────────────────────────────┐")
+    print(f"  │  Prophet MAE  = {mae:6.2f}           │")
+    print(f"  │  Prophet RMSE = {rmse:6.2f}           │")
+    print(f"  │  Prophet R²   = {r2:6.3f}           │")
+    print(f"  └─────────────────────────────────┘")
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(16, 6))
+    train_y.iloc[-90:].plot(ax=ax, label="Train (last 90 days)", color="#1f77b4")
+    test_y.plot(ax=ax, label="Actual", color="#2ca02c")
+    pd.Series(y_pred, index=test_y.index).plot(ax=ax, label="Prophet Forecast",
+                                                color="#9467bd", linestyle="--")
+    ax.fill_between(test_y.index,
+                    forecast["yhat_lower"].values,
+                    forecast["yhat_upper"].values,
+                    alpha=0.2, color="#9467bd", label="Uncertainty interval")
+    ax.set_title(f"Prophet — Forecast vs Actual  (MAE={mae:.2f}, RMSE={rmse:.2f}, R²={r2:.3f})")
+    ax.set_ylabel("ED Visits")
+    ax.legend()
+    plt.tight_layout()
+
+    plot_path = os.path.join(PLOT_DIR, "prophet_forecast_vs_actual.png")
+    plt.savefig(plot_path, dpi=120)
+    plt.close()
+    print(f"  Prophet forecast plot saved → {plot_path}")
+
+    return mae, rmse, r2, plot_path
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 10c — XGBoost with lag features (spike capture)
+# ══════════════════════════════════════════════════════════════════════════
+def fit_xgboost(daily: pd.Series, train_y: pd.Series, test_y: pd.Series) -> tuple:
+    """
+    XGBoost trained on lag features built from the historical series.
+
+    Lag features used:
+      lag_1          → yesterday's ED visits  (strongest short-term signal)
+      lag_7          → same day last week     (captures weekly spikes)
+      rolling_mean_7 → 7-day average          (smooths noise)
+
+    Lags are computed from the full series so the first test-day lags
+    correctly reference the last training-day values.
+    """
+    if not XGBOOST_AVAILABLE:
+        print("\n── STEP 10c: XGBoost — SKIPPED (run: pip install xgboost) ──")
+        return None
+
+    print("\n── STEP 10c: Fit XGBoost with lag features ──")
+
+    # Build lag features from the full series (train + test)
+    # This ensures test lags reference real training history, not future values
+    df = daily.to_frame(name="ed_visits")
+    df["lag_1"]          = df["ed_visits"].shift(1)
+    df["lag_7"]          = df["ed_visits"].shift(7)
+    df["rolling_mean_7"] = df["ed_visits"].rolling(7).mean()
+    df = df.dropna()   # drop the first 7 rows that have no lag history
+
+    feature_cols = ["lag_1", "lag_7", "rolling_mean_7"]
+
+    train_df = df[df.index <= TRAIN_END]
+    test_df  = df[df.index >= TEST_START]
+
+    X_train, y_train = train_df[feature_cols], train_df["ed_visits"]
+    X_test,  y_true  = test_df[feature_cols],  test_df["ed_visits"]
+
+    model = XGBRegressor(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        random_state=42,
+        verbosity=0,
+    )
+    model.fit(X_train, y_train)
+
+    # Save model and the last 7 training values (needed to seed lags at inference time)
+    joblib.dump(model, os.path.join("model", "xgb_demand_model.joblib"))
+    np.save(os.path.join("model", "xgb_seed_values.npy"),
+            train_df["ed_visits"].values[-7:])
+    print("  XGBoost model saved → model/xgb_demand_model.joblib")
+
+    y_pred = model.predict(X_test)
+
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(np.mean((y_true.values - y_pred) ** 2))
+    r2   = r2_score(y_true, y_pred)
+
+    print(f"\n  ┌─────────────────────────────────┐")
+    print(f"  │  XGBoost MAE  = {mae:6.2f}           │")
+    print(f"  │  XGBoost RMSE = {rmse:6.2f}           │")
+    print(f"  │  XGBoost R²   = {r2:6.3f}           │")
+    print(f"  └─────────────────────────────────┘")
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(16, 6))
+    train_y.iloc[-90:].plot(ax=ax, label="Train (last 90 days)", color="#1f77b4")
+    test_y.plot(ax=ax, label="Actual", color="#2ca02c")
+    pd.Series(y_pred, index=y_true.index).plot(ax=ax, label="XGBoost Forecast",
+                                               color="#e377c2", linestyle="--")
+    ax.set_title(f"XGBoost (lag features) — Forecast vs Actual  (MAE={mae:.2f}, RMSE={rmse:.2f}, R²={r2:.3f})")
+    ax.set_ylabel("ED Visits")
+    ax.legend()
+    plt.tight_layout()
+
+    plot_path = os.path.join(PLOT_DIR, "xgboost_forecast_vs_actual.png")
+    plt.savefig(plot_path, dpi=120)
+    plt.close()
+    print(f"  XGBoost forecast plot saved → {plot_path}")
+
+    return mae, rmse, r2, plot_path
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # STEP 12 — Log everything to MLflow
 # ══════════════════════════════════════════════════════════════════════════
-def log_mlflow(model, model_choice: str, mae: float, rmse: float,
+def log_mlflow(model, model_choice: str, mae: float, rmse: float, r2: float,
                       train_size: int, test_size: int, plot_path: str):
     """Log params, metrics and the forecast plot to MLflow for tracking."""
     print("\n── STEP 12: Log to MLflow ──")
@@ -429,6 +524,7 @@ def log_mlflow(model, model_choice: str, mae: float, rmse: float,
         # Evaluation metrics
         mlflow.log_metric("mae",  mae)
         mlflow.log_metric("rmse", rmse)
+        mlflow.log_metric("r2",   r2)
 
         # Save the forecast chart as an artifact
         mlflow.log_artifact(plot_path)
@@ -465,31 +561,57 @@ def run_demand_forecast():
     # Step 6: Based on step 5, choose ARIMA or SARIMAX
     model_choice = decide_model(is_seasonal)
 
-    # Steps 7-8: Add features (educational — ARIMA uses them internally)
-    ts = time_features(daily)
-    ts = lag_features(ts)
+    # Step 7: Time-based split (NO random shuffle)
+    train_y, test_y = split(daily)
 
-    # Step 9: Time-based split (NO random shuffle)
-    train_y, test_y, train_X, test_X = split(ts)
-
-    # Step 10: Auto-optimise and fit the chosen model
-    model = fit_autoarima(train_y, train_X, model_choice)
+    # Step 8: Fit model on past observations only
+    model = fit_autoarima(train_y, model_choice)
 
     # Save model + last training date for Streamlit inference
     joblib.dump(model, os.path.join("model", "demand_model.joblib"))
     with open(os.path.join("model", "demand_last_date.txt"), "w") as f:
         f.write(str(train_y.index.max().date()))
 
-    # Step 11: Evaluate with MAE, RMSE
-    mae, rmse, plot_path = evaluate(model, train_y, test_y, test_X)
+    # Step 9: Evaluate with MAE, RMSE, R²
+    mae, rmse, r2, plot_path = evaluate(model, train_y, test_y)
 
-    # Step 12: Log everything to MLflow
-    log_mlflow(model, model_choice, mae, rmse,
-                      len(train_y), len(test_y), plot_path)
+    # Step 10: Prophet — compare against ARIMA/SARIMAX
+    prophet_result = fit_prophet(train_y, test_y)
+
+    # Step 10c: XGBoost with lag features — best for spike capture
+    xgb_result = fit_xgboost(daily, train_y, test_y)
+
+    # Step 11: Log everything to MLflow (skip gracefully if server is offline)
+    try:
+        log_mlflow(model, model_choice, mae, rmse, r2,
+                          len(train_y), len(test_y), plot_path)
+    except Exception as e:
+        print(f"\n  MLflow logging skipped — server unreachable: {e}")
+
+    # ── Model comparison summary ────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("   MODEL COMPARISON")
+    print("=" * 60)
+    print(f"  {'Model':<20} {'MAE':>8} {'RMSE':>8} {'R²':>8}")
+    print(f"  {'-'*46}")
+    print(f"  {model_choice:<20} {mae:>8.2f} {rmse:>8.2f} {r2:>8.3f}")
+    if prophet_result:
+        p_mae, p_rmse, p_r2, _ = prophet_result
+        print(f"  {'Prophet':<20} {p_mae:>8.2f} {p_rmse:>8.2f} {p_r2:>8.3f}")
+    if xgb_result:
+        x_mae, x_rmse, x_r2, _ = xgb_result
+        print(f"  {'XGBoost (lag feats)':<20} {x_mae:>8.2f} {x_rmse:>8.2f} {x_r2:>8.3f}")
+
+    # Pick the winner by lowest MAE
+    results = {model_choice: mae}
+    if prophet_result: results["Prophet"] = prophet_result[0]
+    if xgb_result:     results["XGBoost"] = xgb_result[0]
+    winner = min(results, key=results.get)
+    print(f"\n  → Best model (MAE): {winner}")
 
     print("\n" + "=" * 60)
     print("   PIPELINE COMPLETE")
-    print(f"   Model: {model_choice}  |  MAE={mae:.2f}  RMSE={rmse:.2f}")
+    print(f"   Model: {winner}  |  MAE={x_mae:.2f}  RMSE={x_rmse:.2f}")
     print("=" * 60)
 
 

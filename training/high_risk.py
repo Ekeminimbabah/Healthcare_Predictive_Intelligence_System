@@ -49,6 +49,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBClassifier
 
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
 from config import MLFLOW_HIGH_RISK_EXPERIMENT, MLFLOW_TRACKING_URI, OUTPUT_PATH, PARAM_GRIDS
 from tracking.mlflow_utils import check_mlflow_connection
 
@@ -188,11 +194,14 @@ def _train_and_evaluate(
         "recall":    round(recall_score(y_test, y_pred), 4),
     }
 
-    with mlflow.start_run(run_name=f"high_risk_{model_name}"):
-        mlflow.log_param("model", model_name)
-        mlflow.log_param("target", "high_risk")
-        mlflow.log_metrics(metrics)
-        mlflow.sklearn.log_model(pipe, artifact_path=model_name)
+    try:
+        with mlflow.start_run(run_name=f"high_risk_{model_name}"):
+            mlflow.log_param("model", model_name)
+            mlflow.log_param("target", "high_risk")
+            mlflow.log_metrics(metrics)
+            mlflow.sklearn.log_model(pipe, artifact_path=model_name)
+    except Exception as e:
+        print(f"  MLflow logging skipped — {e}")
 
     print(
         f"  {model_name:<25} "
@@ -202,6 +211,56 @@ def _train_and_evaluate(
         f"Recall={metrics['recall']}"
     )
     return {**metrics, "pipe": pipe}
+
+
+# ---------------------------------------------------------------------------
+# SHAP explainability — top 30 positive-contributing features
+# ---------------------------------------------------------------------------
+def _shap_analysis(final_pipe, X_test: pd.DataFrame) -> None:
+    if not SHAP_AVAILABLE:
+        print("\n  SHAP skipped — run: pip install shap")
+        return
+
+    print("\n── SHAP Analysis: Top 30 Features Driving High-Risk ──")
+
+    # Step 1: get the preprocessor and model out of the pipeline
+    preprocessor = final_pipe.named_steps["preprocessor"]
+    xgb_model    = final_pipe.named_steps["model"]
+
+    # Step 2: get feature names (numeric + one-hot encoded categoricals)
+    num_names = list(preprocessor.transformers_[0][2])
+    cat_names = list(
+        preprocessor.named_transformers_["cat"]
+        .named_steps["encoder"]
+        .get_feature_names_out(preprocessor.transformers_[1][2])
+    )
+    feature_names = num_names + cat_names
+
+    # Step 3: transform the test data and compute SHAP values
+    X_transformed = preprocessor.transform(X_test)
+    shap_values   = shap.TreeExplainer(xgb_model).shap_values(X_transformed)
+
+    # Step 4: average SHAP value per feature → positive = pushes toward high-risk
+    mean_shap = pd.Series(shap_values.mean(axis=0), index=feature_names)
+    top30     = mean_shap[mean_shap > 0].nlargest(30)
+
+    # Step 5: print ranked table
+    print(f"\n  {'Rank':<5} {'Feature':<45} {'Mean SHAP':>10}")
+    print(f"  {'-'*62}")
+    for rank, (feat, val) in enumerate(top30.items(), 1):
+        print(f"  {rank:<5} {feat:<45} {val:>10.4f}")
+
+    # Step 6: save bar chart
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(10, 9))
+    top30.sort_values().plot(kind="barh", ax=ax, color="#d62728")
+    ax.set_title("Top 30 Features — Positive SHAP Contribution to High-Risk")
+    ax.set_xlabel("Mean SHAP Value")
+    plt.tight_layout()
+    plot_path = os.path.join(OUTPUT_PATH, "shap_top30_positive.png")
+    plt.savefig(plot_path, dpi=120)
+    plt.close()
+    print(f"\n  Chart saved → {plot_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -327,19 +386,25 @@ def run_high_risk_pipeline():
         "best_cv_roc_auc": best_cv_auc,
     }
 
-    with mlflow.start_run(run_name=f"high_risk_{best_name}_tuned"):
-        mlflow.log_param("model", best_name)
-        mlflow.log_param("target", "high_risk")
-        mlflow.log_param("stage", "tuned_final")
-        mlflow.log_param("decision_threshold", THRESHOLD)
-        mlflow.log_params({k: str(v) for k, v in search.best_params_.items()})
-        mlflow.log_metrics(final_metrics)
-        mlflow.sklearn.log_model(final_pipe, artifact_path=f"{best_name}_tuned")
+    try:
+        with mlflow.start_run(run_name=f"high_risk_{best_name}_tuned"):
+            mlflow.log_param("model", best_name)
+            mlflow.log_param("target", "high_risk")
+            mlflow.log_param("stage", "tuned_final")
+            mlflow.log_param("decision_threshold", THRESHOLD)
+            mlflow.log_params({k: str(v) for k, v in search.best_params_.items()})
+            mlflow.log_metrics(final_metrics)
+            mlflow.sklearn.log_model(final_pipe, artifact_path=f"{best_name}_tuned")
+    except Exception as e:
+        print(f"  MLflow logging skipped — {e}")
 
     # Save model to disk for Streamlit inference
     model_path = os.path.join(OUTPUT_PATH, "high_risk_model.joblib")
     joblib.dump(final_pipe, model_path)
     print(f"  Model saved → {model_path}")
+
+    # SHAP explainability
+    _shap_analysis(final_pipe, X_test)
 
     print("\n" + "=" * 65)
     print("  FINAL TUNED MODEL RESULTS")
@@ -360,10 +425,10 @@ def run_high_risk_pipeline():
 # Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(MLFLOW_HIGH_RISK_EXPERIMENT)
-
-    if not check_mlflow_connection():
-        raise SystemExit("Aborting: MLflow server is not reachable.")
+    try:
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(MLFLOW_HIGH_RISK_EXPERIMENT)
+    except Exception:
+        print("Warning: MLflow server not reachable — MLflow logging will be skipped.")
 
     run_high_risk_pipeline()
