@@ -35,8 +35,11 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.metrics import (
     classification_report,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
@@ -211,6 +214,29 @@ def _train_and_evaluate(
         f"Recall={metrics['recall']}"
     )
     return {**metrics, "pipe": pipe}
+
+
+# ---------------------------------------------------------------------------
+# Confusion matrix helper
+# ---------------------------------------------------------------------------
+def _save_confusion_matrix(y_test, y_pred) -> str:
+    cm = confusion_matrix(y_test, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+        xticklabels=["Low Risk", "High Risk"],
+        yticklabels=["Low Risk", "High Risk"],
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title("Confusion Matrix — High-Risk Model (tuned XGBoost)")
+    plt.tight_layout()
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
+    path = os.path.join(OUTPUT_PATH, "high_risk_confusion_matrix.png")
+    plt.savefig(path, dpi=120)
+    plt.show()
+    print(f"  Confusion matrix saved → {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +443,9 @@ def run_high_risk_pipeline():
     print("=" * 65)
     print("\nClassification Report:")
     print(classification_report(y_test, y_pred, target_names=["Low Risk", "High Risk"]))
+
+    print("\nConfusion Matrix:")
+    _save_confusion_matrix(y_test, y_pred)
 
     return results, final_pipe, final_metrics
 
